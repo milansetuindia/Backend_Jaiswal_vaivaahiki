@@ -28,6 +28,11 @@ const paymentSchema = new mongoose.Schema({
         default: null
     },
 
+    recoveryHash: {
+        type: String,
+        default: null
+    },
+
     used: {
         type: Boolean,
         default: false

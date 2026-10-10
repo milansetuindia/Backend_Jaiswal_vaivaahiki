@@ -1,8 +1,5 @@
-//controllers/paymentController.js
-
-const Razorpay = require("razorpay");
 const crypto = require("crypto");
-const { v4: uuidv4 } = require("uuid");
+const Razorpay = require("razorpay");
 
 const Payment = require("../models/Payment");
 
@@ -11,268 +8,527 @@ const razorpay = new Razorpay({
     key_secret: process.env.RAZORPAY_KEY_SECRET
 });
 
+function createToken() {
+    return crypto.randomBytes(32).toString("hex");
+}
+
+function hashRecoveryKey(key) {
+    return crypto
+        .createHash("sha256")
+        .update(key)
+        .digest("hex");
+}
+
+function paymentError(res, status, message) {
+    return res.status(status).json({
+        success: false,
+        message
+    });
+}
+
+function validSignature(provided, expected) {
+
+    if (
+        typeof provided !== "string" ||
+        !/^[a-f0-9]{64}$/i.test(provided)
+    ) {
+        return false;
+    }
+
+    return crypto.timingSafeEqual(
+        Buffer.from(provided, "hex"),
+        Buffer.from(expected, "hex")
+    );
+}
 
 
+/* ==========================================
+   GRANT ONE DOWNLOAD TOKEN PER PAYMENT
+========================================== */
+
+async function grantDownload(
+    payment,
+    paymentId,
+    signature = null
+) {
+
+    if (payment.used) {
+        return {
+            success: false,
+            message: "Download already used"
+        };
+    }
+
+    if (payment.downloadToken) {
+        return {
+            success: true,
+            token: payment.downloadToken
+        };
+    }
+
+    const updated = await Payment.findOneAndUpdate(
+
+        {
+            _id: payment._id,
+            used: false,
+            downloadToken: null
+        },
+
+        {
+            $set: {
+                paymentId: paymentId,
+                signature: signature,
+                downloadToken: createToken()
+            }
+        },
+
+        {
+            new: true
+        }
+    );
+
+    if (updated) {
+        return {
+            success: true,
+            token: updated.downloadToken
+        };
+    }
+
+    const latest = await Payment.findById(payment._id);
+
+    if (!latest || latest.used) {
+        return {
+            success: false,
+            message: "Download already used"
+        };
+    }
+
+    return latest.downloadToken
+        ? {
+            success: true,
+            token: latest.downloadToken
+        }
+        : {
+            success: false,
+            message: "Payment verification pending"
+        };
+}
+
+
+/* ==========================================
+   CREATE RAZORPAY ORDER
+========================================== */
 
 exports.createOrder = async (req, res) => {
 
     try {
 
-        const amount = Number(process.env.PDF_PRICE);
+        const price = Number(process.env.PDF_PRICE);
 
-        const options = {
-            amount: amount * 100,
+        if (!Number.isSafeInteger(price) || price <= 0) {
+            return paymentError(
+                res,
+                500,
+                "Invalid PDF price configuration"
+            );
+        }
+
+        const order = await razorpay.orders.create({
+
+            amount: price * 100,
+
             currency: "INR",
-            receipt: "receipt_" + Date.now()
-        };
 
-        const order = await razorpay.orders.create(options);
+            receipt:
+                "biodata_" +
+                crypto.randomBytes(8).toString("hex")
+
+        });
+
+        const recoveryKey = createToken();
 
         await Payment.create({
+
             orderId: order.id,
-            amount: amount,
+
+            amount: price,
+
+            recoveryHash: hashRecoveryKey(recoveryKey),
+
             used: false
+
         });
 
-        res.json({
+        return res.json({
+
             success: true,
-            order
+
+            order: order,
+
+            recoveryKey: recoveryKey
+
         });
 
-    } catch (err) {
+    } catch (error) {
 
-        res.status(500).json({
-            success: false,
-            message: err.message
-        });
+        console.error("Create Order Error:", error);
+
+        return paymentError(
+            res,
+            500,
+            "Unable to create payment order"
+        );
 
     }
 
 };
 
 
-
-
-
-
+/* ==========================================
+   VERIFY RAZORPAY PAYMENT
+========================================== */
 
 exports.verifyPayment = async (req, res) => {
 
     try {
 
         const {
+            razorpay_order_id: orderId,
+            razorpay_payment_id: paymentId,
+            razorpay_signature: signature
+        } = req.body || {};
 
-            razorpay_order_id,
+        if (
+            !orderId ||
+            !paymentId ||
+            !signature
+        ) {
+            return paymentError(
+                res,
+                400,
+                "Missing payment details"
+            );
+        }
 
-            razorpay_payment_id,
-
-            razorpay_signature
-
-        } = req.body;
-
-        const body =
-            razorpay_order_id +
-            "|" +
-            razorpay_payment_id;
-
-        const expected = crypto
-
+        const expectedSignature = crypto
             .createHmac(
                 "sha256",
                 process.env.RAZORPAY_KEY_SECRET
             )
-
-            .update(body)
-
+            .update(orderId + "|" + paymentId)
             .digest("hex");
 
-        if (expected !== razorpay_signature) {
-
-            return res.status(400).json({
-
-                success: false,
-
-                message: "Invalid Signature"
-
-            });
-
+        if (!validSignature(signature, expectedSignature)) {
+            return paymentError(
+                res,
+                400,
+                "Invalid payment signature"
+            );
         }
 
-        const payment =
-            await Payment.findOne({
-
-                orderId: razorpay_order_id
-
-            });
+        const payment = await Payment.findOne({
+            orderId: orderId
+        });
 
         if (!payment) {
+            return paymentError(
+                res,
+                404,
+                "Payment order not found"
+            );
+        }
 
-            return res.status(404).json({
+        const remotePayment =
+            await razorpay.payments.fetch(paymentId);
 
-                success: false,
+        if (
+            remotePayment.order_id !== orderId ||
+            remotePayment.amount !== payment.amount * 100 ||
+            remotePayment.currency !== "INR" ||
+            remotePayment.status !== "captured"
+        ) {
 
-                message: "Payment not found"
-
-            });
+            return paymentError(
+                res,
+                409,
+                "Payment not captured yet. Retry verification."
+            );
 
         }
 
-        payment.paymentId =
-            razorpay_payment_id;
+        const result = await grantDownload(
+            payment,
+            paymentId,
+            signature
+        );
 
-        payment.signature =
-            razorpay_signature;
+        return res.json(result);
 
-        payment.downloadToken =
-            uuidv4();
+    } catch (error) {
 
-        await payment.save();
+        console.error("Verify Payment Error:", error);
 
-        res.json({
-
-            success: true,
-
-            token:
-                payment.downloadToken
-
-        });
-
-    }
-
-    catch (err) {
-
-        res.status(500).json({
-
-            success: false,
-
-            message: err.message
-
-        });
+        return paymentError(
+            res,
+            503,
+            "Payment verification unavailable. Retry without paying again."
+        );
 
     }
 
 };
 
 
+/* ==========================================
+   RECOVER COMPLETED PAYMENT
+========================================== */
+
+exports.recoverPayment = async (req, res) => {
+
+    try {
+
+        const {
+            orderId,
+            recoveryKey
+        } = req.body || {};
+
+        if (
+            typeof orderId !== "string" ||
+            typeof recoveryKey !== "string" ||
+            !/^[a-f0-9]{64}$/.test(recoveryKey)
+        ) {
+
+            return paymentError(
+                res,
+                400,
+                "Invalid recovery details"
+            );
+
+        }
+
+        const payment = await Payment.findOne({
+
+            orderId: orderId,
+
+            recoveryHash: hashRecoveryKey(recoveryKey)
+
+        });
+
+        if (!payment) {
+            return paymentError(
+                res,
+                404,
+                "Recovery record not found"
+            );
+        }
+
+        if (payment.used) {
+            return paymentError(
+                res,
+                409,
+                "Download already used"
+            );
+        }
+
+        if (payment.downloadToken) {
+
+            return res.json({
+
+                success: true,
+
+                token: payment.downloadToken
+
+            });
+
+        }
+
+        // Check Razorpay directly for a completed payment
+        const result =
+            await razorpay.orders.fetchPayments(orderId);
+
+        const capturedPayment =
+            (result.items || []).find(item => {
+
+                return (
+                    item.order_id === orderId &&
+                    item.status === "captured" &&
+                    item.currency === "INR" &&
+                    item.amount === payment.amount * 100
+                );
+
+            });
+
+        if (!capturedPayment) {
+
+            return res.json({
+
+                success: false,
+
+                pending: true,
+
+                message:
+                    "Payment not confirmed yet. " +
+                    "Please retry without paying again."
+
+            });
+
+        }
+
+        const entitlement = await grantDownload(
+            payment,
+            capturedPayment.id
+        );
+
+        return res.json(entitlement);
+
+    } catch (error) {
+
+        console.error("Recover Payment Error:", error);
+
+        return paymentError(
+            res,
+            503,
+            "Cannot check payment now. Retry later without paying again."
+        );
+
+    }
+
+};
 
 
+/* ==========================================
+   VERIFY UNUSED DOWNLOAD CREDIT
+========================================== */
 
 exports.verifyDownload = async (req, res) => {
 
     try {
 
-        const { token } = req.body;
+        const { token } = req.body || {};
+
+        if (
+            typeof token !== "string" ||
+            token.length < 32
+        ) {
+            return paymentError(
+                res,
+                400,
+                "Invalid download token"
+            );
+        }
 
         const payment = await Payment.findOne({
-
             downloadToken: token
-
         });
 
         if (!payment) {
-
-            return res.json({
-
-                success: false,
-                message: "Invalid token"
-
-            });
-
+            return paymentError(
+                res,
+                404,
+                "Download token not found"
+            );
         }
 
         if (payment.used) {
-
-            return res.json({
-
-                success: false,
-                message: "Download already used"
-
-            });
-
+            return paymentError(
+                res,
+                409,
+                "Download already used"
+            );
         }
 
-        res.json({
-
+        return res.json({
             success: true
-
         });
 
-    }
+    } catch (error) {
 
-    catch (err) {
+        console.error("Verify Download Error:", error);
 
-        res.status(500).json({
-
-            success: false,
-            message: err.message
-
-        });
+        return paymentError(
+            res,
+            503,
+            "Download verification temporarily unavailable"
+        );
 
     }
 
 };
 
 
-
-
-
-
-
+/* ==========================================
+   MARK DOWNLOAD CREDIT AS USED
+========================================== */
 
 exports.markUsed = async (req, res) => {
 
     try {
 
-        const { token } = req.body;
+        const { token } = req.body || {};
+
+        if (
+            typeof token !== "string" ||
+            token.length < 32
+        ) {
+            return paymentError(
+                res,
+                400,
+                "Invalid download token"
+            );
+        }
 
         const payment = await Payment.findOneAndUpdate(
+
             {
-                downloadToken: token
+                downloadToken: token,
+                used: false
             },
+
             {
-                used: true
+                $set: {
+                    used: true
+                }
             },
+
             {
                 new: true
             }
+
         );
 
-        if (!payment) {
-
-            return res.status(404).json({
-
-                success: false,
-                message: "Invalid download token"
-
+        if (payment) {
+            return res.json({
+                success: true
             });
-
         }
 
-        res.json({
-
-            success: true
-
+        const existing = await Payment.findOne({
+            downloadToken: token
         });
 
-    }
+        if (existing && existing.used) {
+            return res.json({
+                success: true,
+                alreadyUsed: true
+            });
+        }
 
-    catch (err) {
+        return paymentError(
+            res,
+            404,
+            "Invalid download token"
+        );
 
-        res.status(500).json({
+    } catch (error) {
 
-            success: false,
-            message: err.message
+        console.error("Mark Used Error:", error);
 
-        });
+        return paymentError(
+            res,
+            503,
+            "Unable to finalize download"
+        );
 
     }
 
 };
-
-
-
-
-
-
-
-
