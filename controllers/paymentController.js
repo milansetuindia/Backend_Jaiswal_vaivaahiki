@@ -360,15 +360,61 @@ exports.recoverPayment = async (req, res) => {
 
         if (!capturedPayment) {
 
+            // Get the latest order details directly from Razorpay.
+            const order = await razorpay.orders.fetch(orderId);
+
+            // Make sure this is the correct order and amount.
+            if (
+                order.id !== orderId ||
+                order.amount !== payment.amount * 100 ||
+                order.currency !== "INR"
+            ) {
+
+                return paymentError(
+                    res,
+                    409,
+                    "Razorpay order details do not match."
+                );
+
+            }
+
+            // If any payment is authorized but not yet captured,
+            // don't reopen checkout.
+
+            const hasAuthorizedPayment =
+                (result.items || []).some(item =>
+
+                    item.order_id === orderId &&
+                    item.status === "authorized"
+
+                );
+
+            // Only permit checkout to resume when the order
+            // is not paid and no payment is awaiting capture.
+
+            const resumable =
+                ["created", "attempted"].includes(order.status) &&
+                !hasAuthorizedPayment;
+
             return res.json({
 
                 success: false,
 
                 pending: true,
 
-                message:
-                    "Payment not confirmed yet. " +
-                    "Please retry without paying again."
+                resumable: resumable,
+
+                order: resumable
+                    ? {
+                        id: order.id,
+                        amount: order.amount,
+                        currency: order.currency
+                    }
+                    : null,
+
+                message: resumable
+                    ? "Previous payment was not completed. Checkout can be reopened."
+                    : "Payment is being processed. Please retry later without paying again."
 
             });
 
